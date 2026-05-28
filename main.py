@@ -1,6 +1,6 @@
 """
 EdgeParlay Main
-Runs model training + web dashboard + daily scheduler together
+Web server starts FIRST, then model trains in background
 """
 import os
 import sys
@@ -14,13 +14,15 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'edgeparlay_model.pkl')
+MODEL_READY = False
 
 def ensure_model_exists():
+    global MODEL_READY
     if os.path.exists(MODEL_PATH):
         print("✅ Trained model found")
+        MODEL_READY = True
         return True
-    print("⚠️  No trained model found. Training now...")
-    print("   This takes 2-3 minutes on first startup...")
+    print("⚠️  No trained model found. Training in background...")
     try:
         os.makedirs('models', exist_ok=True)
         os.makedirs('data/raw/tennis', exist_ok=True)
@@ -37,10 +39,9 @@ def ensure_model_exists():
         result = train_model(df)
         if result:
             print("✅ Model trained and saved successfully")
+            MODEL_READY = True
             return True
-        else:
-            print("❌ Model training failed")
-            return False
+        return False
     except Exception as e:
         print(f"❌ Training error: {e}")
         return False
@@ -52,8 +53,8 @@ def get_bankroll() -> float:
         result = supabase.table('bankroll').select('amount').order('id', desc=True).limit(1).execute()
         if result.data:
             return float(result.data[0]['amount'])
-    except Exception as e:
-        print(f"⚠️ Could not fetch bankroll: {e}")
+    except:
+        pass
     return float(os.getenv('BANKROLL', 100))
 
 def save_parlay(parlay: dict) -> int:
@@ -75,9 +76,7 @@ def save_parlay(parlay: dict) -> int:
         }
         result = supabase.table('parlays').insert(record).execute()
         if result.data:
-            parlay_id = result.data[0]['id']
-            print(f"✅ Parlay saved to database (ID: {parlay_id})")
-            return parlay_id
+            return result.data[0]['id']
     except Exception as e:
         print(f"⚠️ Could not save parlay: {e}")
     return -1
@@ -93,14 +92,11 @@ def run_morning_picks():
         from backend.telegram_bot import send_morning_parlay, send_no_bet_alert
 
         bankroll = get_bankroll()
-        print(f"💰 Current bankroll: ${bankroll:.2f}")
-
         pipeline_result = run_pipeline(save_to_db=True)
         opportunities = pipeline_result.get('best_opportunities', [])
 
         if not opportunities:
-            print("⚠️  No odds data available.")
-            send_no_bet_alert("No live odds data available. Check back later.")
+            send_no_bet_alert("No live odds data available.")
             return None
 
         engine = ConfidenceEngine()
@@ -108,8 +104,7 @@ def run_morning_picks():
         scored = engine.score_all(opportunities)
 
         if not scored:
-            print("⚠️  No high-confidence opportunities found today.")
-            send_no_bet_alert("Model confidence too low across all available markets. Protecting bankroll.")
+            send_no_bet_alert("Model confidence too low. Protecting bankroll.")
             return None
 
         constructor = ParlayConstructor(bankroll=bankroll)
@@ -117,15 +112,12 @@ def run_morning_picks():
         should_bet, reason = constructor.should_bet_today(parlay)
 
         if not should_bet or not parlay:
-            print(f"⚠️  No bet today: {reason}")
             send_no_bet_alert(reason)
             return None
 
-        parlay_id = save_parlay(parlay)
-        parlay['id'] = parlay_id
+        parlay['id'] = save_parlay(parlay)
         print(constructor.format_parlay_summary(parlay))
         send_morning_parlay(parlay)
-        print(f"\n✅ Morning picks complete. Parlay sent to Telegram.")
         return parlay
     except Exception as e:
         print(f"❌ Morning picks error: {e}")
@@ -134,7 +126,6 @@ def run_morning_picks():
 def run_scheduler():
     from apscheduler.schedulers.blocking import BlockingScheduler
     from apscheduler.triggers.cron import CronTrigger
-    from backend.telegram_bot import send_welcome_message
 
     scheduler = BlockingScheduler(timezone='US/Central')
     scheduler.add_job(
@@ -143,44 +134,40 @@ def run_scheduler():
         id='morning_picks',
         name='Morning Parlay Picks'
     )
-    print("🚀 EdgeParlay Scheduler started")
-    print("⏰ Morning picks scheduled: 6:00 AM Central daily")
-    send_welcome_message()
+    print("⏰ Scheduler: 6:00 AM Central daily")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        print("\n👋 EdgeParlay scheduler stopped")
-
-def run_web_server():
-    from backend.api import app
-    import uvicorn
-    port = int(os.getenv('PORT', 8000))
-    print(f"🌐 EdgeParlay Dashboard starting on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+        pass
 
 if __name__ == "__main__":
-    # Step 1: ensure model is trained
-    ensure_model_exists()
-
-    # Step 2: check for command line args
     command = sys.argv[1] if len(sys.argv) > 1 else 'serve'
 
     if command == 'morning':
+        ensure_model_exists()
         run_morning_picks()
     elif command == 'schedule':
+        ensure_model_exists()
         run_scheduler()
     elif command == 'train':
         if os.path.exists(MODEL_PATH):
             os.remove(MODEL_PATH)
         ensure_model_exists()
     else:
-        # Default: run BOTH scheduler and web server together
-        print("🚀 Starting EdgeParlay — scheduler + dashboard...")
+        # DEFAULT: start web server FIRST, train model + scheduler in background
+        print("🚀 EdgeParlay starting...")
 
-        # Scheduler runs in background thread
+        # Train model in background thread (non-blocking)
+        training_thread = threading.Thread(target=ensure_model_exists, daemon=True)
+        training_thread.start()
+
+        # Scheduler in background thread
         scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
         scheduler_thread.start()
-        print("✅ Scheduler thread started")
 
-        # Web server runs in main thread (keeps process alive)
-        run_web_server()
+        # Web server starts IMMEDIATELY in main thread
+        from backend.api import app
+        import uvicorn
+        port = int(os.getenv('PORT', 8000))
+        print(f"🌐 Dashboard → http://0.0.0.0:{port}")
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
