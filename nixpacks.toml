@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python311", "pip"]
-
-[phases.install]
-cmds = ["pip install -r requirements.txt --no-cache-dir --timeout 120 --retries 5"]
-
-[start]
-cmd = "python main.py schedule"
