@@ -194,3 +194,24 @@ if __name__ == "__main__":
             print(f"Unknown command: {command}")
     else:
         run_scheduler()
+
+
+def run_web_server():
+    """Run the FastAPI dashboard server"""
+    import uvicorn
+    from backend.api import app
+    port = int(os.getenv('PORT', 8000))
+    print(f"🌐 Dashboard starting on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+def run_all():
+    """Run both scheduler and web server in parallel threads"""
+    import threading
+
+    # Start scheduler in background thread
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # Run web server in main thread
+    run_web_server()
