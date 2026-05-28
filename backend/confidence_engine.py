@@ -1,445 +1,391 @@
 """
-EdgeParlay Confidence Engine
-Hybrid rules-based + ML scoring system
-Scores every available bet by true confidence
+EdgeParlay Confidence Engine v2
+Upgraded with:
+- Odds filter (rejects unplayable lines like -10000)
+- Surface/tournament awareness (French Open clay)
+- Stricter confidence thresholds
+- Cross-sport regime detection
+- Tournament variance penalties
+- Danger flag system
 """
 import os
+import sys
+import pickle
 import numpy as np
-import pandas as pd
 from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv
 
-load_dotenv('/home/claude/edgeparlay/.env')
+load_dotenv()
 
-# ─── RULES-BASED SCORER ──────────────────────────────────────────────────────
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'models', 'edgeparlay_model.pkl')
+
+# Absolute odds limits
+MAX_ODDS_AMERICAN = -110      # No slight favorites
+MIN_ODDS_AMERICAN = -1500     # No unplayable lines
+
+# Current clay tournaments (French Open is running now)
+CLAY_TOURNAMENTS = [
+    'french open', 'roland garros', 'madrid', 'barcelona',
+    'rome', 'monte carlo', 'hamburg', 'geneva', 'lyon',
+    'estoril', 'bucharest', 'marrakech', 'istanbul'
+]
+
+# Clay specialists - bonus on clay
+CLAY_SPECIALISTS = [
+    'rafael nadal', 'carlos alcaraz', 'casper ruud', 'jannik sinner',
+    'stefanos tsitsipas', 'holger rune', 'nicolas jarry',
+    'alejandro davidovich fokina', 'albert ramos-vinolas',
+    'pablo carreno busta', 'pedro martinez', 'diego schwartzman',
+    'flavio cobolli', 'matteo arnaldi', 'francisco cerundolo'
+]
+
+# Hard court specialists - penalty on clay
+HARD_COURT_SPECIALISTS = [
+    'daniil medvedev', 'andrey rublev', 'taylor fritz',
+    'frances tiafoe', 'ben shelton', 'felix auger aliassime',
+    'tommy paul', 'alex de minaur', 'grigor dimitrov'
+]
+
 
 class RulesScorer:
     """
-    Fast, transparent, interpretable confidence scorer
-    Based on documented historical win rates by sport and market type
+    Transparent rules-based scorer
+    Based on documented historical win rates
+    Includes surface, tournament, and danger flag logic
     """
-    
-    # Historical win rates by sport for heavy favorites
+
     SPORT_BASE_RATES = {
         'MLB': {
-            'heavy_favorite': 0.72,      # -200 or better moneyline
-            'moderate_favorite': 0.62,   # -150 to -199
-            'slight_favorite': 0.55,     # -110 to -149
-            'total': 0.52,               # Over/under
+            'heavy_favorite': 0.69,
+            'moderate_favorite': 0.61,
+            'slight_favorite': 0.54,
         },
         'NBA': {
-            'heavy_favorite': 0.78,      # Playoffs heavy favorites
-            'moderate_favorite': 0.65,
-            'slight_favorite': 0.57,
-            'total': 0.53,
+            'heavy_favorite': 0.76,
+            'moderate_favorite': 0.64,
+            'slight_favorite': 0.56,
         },
         'EPL Soccer': {
-            'heavy_favorite': 0.68,      # Top 6 vs bottom 6 at home
-            'moderate_favorite': 0.58,
-            'slight_favorite': 0.50,     # Soccer draws are unpredictable
-            'total': 0.51,
+            'heavy_favorite': 0.66,
+            'moderate_favorite': 0.56,
+            'slight_favorite': 0.48,
         },
         'Champions League': {
-            'heavy_favorite': 0.70,
-            'moderate_favorite': 0.60,
-            'slight_favorite': 0.52,
-            'total': 0.51,
+            'heavy_favorite': 0.68,
+            'moderate_favorite': 0.58,
+            'slight_favorite': 0.50,
         },
         'MLS Soccer': {
-            'heavy_favorite': 0.63,
-            'moderate_favorite': 0.55,
-            'slight_favorite': 0.49,
-            'total': 0.50,
+            'heavy_favorite': 0.61,
+            'moderate_favorite': 0.53,
+            'slight_favorite': 0.47,
         },
         'UFC/MMA': {
-            'heavy_favorite': 0.75,      # -400 or better only
-            'moderate_favorite': 0.62,
-            'slight_favorite': 0.54,
-            'total': 0.50,
+            'heavy_favorite': 0.73,
+            'moderate_favorite': 0.60,
+            'slight_favorite': 0.52,
         },
         'Tennis ATP': {
-            'heavy_favorite': 0.85,      # Top 10 vs 50+ ranked
-            'moderate_favorite': 0.72,
-            'slight_favorite': 0.60,
-            'total': 0.55,
+            'heavy_favorite': 0.81,
+            'moderate_favorite': 0.68,
+            'slight_favorite': 0.57,
         },
         'Tennis WTA': {
-            'heavy_favorite': 0.82,
-            'moderate_favorite': 0.70,
-            'slight_favorite': 0.58,
-            'total': 0.54,
+            'heavy_favorite': 0.78,
+            'moderate_favorite': 0.66,
+            'slight_favorite': 0.55,
         },
     }
-    
-    def get_favorite_tier(self, odds_american: int) -> str:
-        """Classify bet by how heavy the favorite is"""
-        if odds_american < 0:
-            # Negative odds = favorite
-            if odds_american <= -300:
-                return 'heavy_favorite'
-            elif odds_american <= -200:
-                return 'moderate_favorite'
-            elif odds_american <= -110:
-                return 'slight_favorite'
-            else:
-                return 'slight_favorite'
-        else:
-            # Positive odds = underdog - lower confidence
-            return 'underdog'
-    
-    def score(self, opportunity: dict) -> dict:
-        """
-        Score a single betting opportunity
-        Returns confidence score and reasoning
-        """
-        sport = opportunity.get('sport', 'Unknown')
-        odds = opportunity.get('odds_american', 0)
-        true_prob = opportunity.get('true_probability', 0.5)
-        implied_prob = opportunity.get('implied_probability', 0.5)
-        market = opportunity.get('market', 'h2h')
-        
-        # Get base rate for this sport
-        sport_rates = self.SPORT_BASE_RATES.get(sport, {
-            'heavy_favorite': 0.65,
-            'moderate_favorite': 0.57,
-            'slight_favorite': 0.52,
-            'total': 0.51,
-        })
-        
-        # Get favorite tier
-        tier = self.get_favorite_tier(odds)
-        
-        # Underdogs are excluded from parlay legs
+
+    def is_valid_odds(self, odds: int) -> bool:
+        if odds >= 0:
+            return False
+        if odds < MIN_ODDS_AMERICAN:
+            return False
+        if odds > MAX_ODDS_AMERICAN:
+            return False
+        return True
+
+    def get_tier(self, odds: int) -> str:
+        if odds <= -300:
+            return 'heavy_favorite'
+        elif odds <= -200:
+            return 'moderate_favorite'
+        elif odds <= -110:
+            return 'slight_favorite'
+        return 'underdog'
+
+    def get_tournament_context(self, event_name: str) -> dict:
+        e = event_name.lower() if event_name else ''
+        is_clay = any(t in e for t in CLAY_TOURNAMENTS)
+        is_grass = any(t in e for t in ['wimbledon', 'queens', 'halle', 'eastbourne', 'newport'])
+        is_slam = any(t in e for t in ['french open', 'roland garros', 'wimbledon', 'us open', 'australian open'])
+        return {
+            'surface': 'clay' if is_clay else ('grass' if is_grass else 'hard'),
+            'is_clay': is_clay,
+            'is_grass': is_grass,
+            'is_grand_slam': is_slam
+        }
+
+    def get_surface_adj(self, player: str, surface: str) -> float:
+        p = player.lower() if player else ''
+        if surface == 'clay':
+            if any(s in p for s in CLAY_SPECIALISTS):
+                return +0.04
+            if any(s in p for s in HARD_COURT_SPECIALISTS):
+                return -0.05
+        return 0.0
+
+    def score(self, opp: dict) -> dict:
+        sport = opp.get('sport', 'Unknown')
+        odds = opp.get('odds_american', 0)
+        true_prob = opp.get('true_probability', 0.5)
+        implied_prob = opp.get('implied_probability', 0.5)
+        event_name = opp.get('event_name', '')
+        selection = opp.get('selection', '')
+
+        # Hard reject invalid odds
+        if not self.is_valid_odds(odds):
+            return {
+                'rules_confidence': 0.0,
+                'tier': 'rejected',
+                'reasoning': f'Odds {odds} rejected (valid range: {MIN_ODDS_AMERICAN} to {MAX_ODDS_AMERICAN})',
+                'mispricing_gap': 0,
+                'value_bet': False,
+                'danger_flags': ['invalid_odds']
+            }
+
+        tier = self.get_tier(odds)
         if tier == 'underdog':
             return {
-                'rules_confidence': 0.30,
+                'rules_confidence': 0.0,
                 'tier': 'underdog',
-                'reasoning': 'Underdog bet - excluded from high confidence parlays',
+                'reasoning': 'Underdog excluded',
                 'mispricing_gap': 0,
-                'value_bet': False
+                'value_bet': False,
+                'danger_flags': ['underdog']
             }
-        
-        # Base confidence from historical rates
-        if 'total' in market.lower():
-            base_confidence = sport_rates.get('total', 0.51)
-        else:
-            base_confidence = sport_rates.get(tier, 0.55)
-        
-        # Calculate mispricing gap
-        mispricing_gap = true_prob - implied_prob
-        
-        # Adjust confidence based on mispricing
-        # If we think true probability is higher than book implies - positive edge
-        adjusted_confidence = base_confidence + (mispricing_gap * 0.5)
-        
-        # Tennis bonus - most reliable sport for heavy favorites
-        if 'Tennis' in sport and tier == 'heavy_favorite':
-            adjusted_confidence = min(0.88, adjusted_confidence + 0.05)
-        
-        # UFC penalty - high variance sport
-        if 'UFC' in sport and tier != 'heavy_favorite':
-            adjusted_confidence = max(0.45, adjusted_confidence - 0.08)
-        
-        # Soccer draw risk penalty
-        if 'Soccer' in sport and tier == 'slight_favorite':
-            adjusted_confidence = max(0.45, adjusted_confidence - 0.05)
-        
-        # Cap confidence between 0.40 and 0.90
-        final_confidence = max(0.40, min(0.90, adjusted_confidence))
-        
-        # Determine if this is a value bet (mispriced by sportsbook)
-        value_bet = mispricing_gap > 0.05  # 5%+ gap is meaningful value
-        
-        reasoning_parts = [
-            f"Historical {sport} {tier.replace('_', ' ')} win rate: {base_confidence:.0%}",
-        ]
+
+        sport_rates = self.SPORT_BASE_RATES.get(sport, {
+            'heavy_favorite': 0.63,
+            'moderate_favorite': 0.55,
+            'slight_favorite': 0.50,
+        })
+        base = sport_rates.get(tier, 0.55)
+        mispricing = true_prob - implied_prob
+        adjusted = base + (mispricing * 0.4)
+        danger_flags = []
+        reasoning = [f"{sport} {tier.replace('_',' ')}: {base:.0%}"]
+
+        if 'Tennis' in sport:
+            ctx = self.get_tournament_context(event_name)
+            surface_adj = self.get_surface_adj(selection, ctx['surface'])
+            adjusted += surface_adj
+            if surface_adj != 0:
+                reasoning.append(f"Surface adj: {surface_adj:+.0%}")
+            if ctx['is_grand_slam']:
+                adjusted -= 0.03
+                danger_flags.append('grand_slam_variance')
+                reasoning.append("Grand slam -3%")
+
+        elif 'UFC' in sport:
+            if tier != 'heavy_favorite':
+                adjusted -= 0.10
+                danger_flags.append('ufc_variance')
+                reasoning.append("UFC moderate fav -10%")
+
+        elif 'Soccer' in sport:
+            if tier == 'slight_favorite':
+                adjusted -= 0.08
+                danger_flags.append('draw_risk')
+                reasoning.append("Draw risk -8%")
+            elif tier == 'moderate_favorite':
+                adjusted -= 0.03
+                reasoning.append("Draw risk -3%")
+
+        elif 'MLB' in sport:
+            danger_flags.append('verify_pitcher')
+            reasoning.append("Verify starter")
+
+        value_bet = mispricing > 0.05
         if value_bet:
-            reasoning_parts.append(f"Mispriced by {mispricing_gap:.1%} vs true probability")
-        if 'Tennis' in sport and tier == 'heavy_favorite':
-            reasoning_parts.append("Tennis heavy favorite bonus applied")
-            
+            reasoning.append(f"Value: +{mispricing:.1%}")
+
+        final = max(0.35, min(0.87, adjusted))
+
         return {
-            'rules_confidence': round(final_confidence, 4),
+            'rules_confidence': round(final, 4),
             'tier': tier,
-            'reasoning': ' | '.join(reasoning_parts),
-            'mispricing_gap': round(mispricing_gap, 4),
-            'value_bet': value_bet
+            'reasoning': ' | '.join(reasoning),
+            'mispricing_gap': round(mispricing, 4),
+            'value_bet': value_bet,
+            'danger_flags': danger_flags,
         }
 
 
-# ─── ML SCORER ───────────────────────────────────────────────────────────────
-
 class MLScorer:
-    """
-    LightGBM-based scorer
-    Trained on historical outcomes
-    Falls back to rules-based when insufficient data
-    """
-    
+    """LightGBM scorer with Platt calibration"""
+
+    FEATURE_COLS = [
+        'odds_decimal', 'true_probability', 'implied_probability',
+        'mispricing_gap', 'is_tennis', 'is_mlb', 'is_nba',
+        'is_soccer', 'is_ufc', 'is_heavy_favorite', 'is_moderate_favorite',
+        'is_total_market', 'odds_american_abs', 'favorite_tier'
+    ]
+
     def __init__(self):
         self.model = None
         self.is_trained = False
-        self.feature_columns = [
-            'odds_decimal', 'true_probability', 'implied_probability',
-            'mispricing_gap', 'is_tennis', 'is_mlb', 'is_nba',
-            'is_soccer', 'is_ufc', 'is_heavy_favorite', 'is_moderate_favorite',
-            'is_total_market', 'odds_american_abs'
-        ]
-    
-    def prepare_features(self, opportunity: dict, rules_result: dict) -> np.ndarray:
-        """Extract features for ML model"""
-        sport = opportunity.get('sport', '')
-        odds = opportunity.get('odds_american', -110)
-        market = opportunity.get('market', 'h2h')
-        
-        features = {
-            'odds_decimal': opportunity.get('odds_decimal', 1.9),
-            'true_probability': opportunity.get('true_probability', 0.5),
-            'implied_probability': opportunity.get('implied_probability', 0.5),
-            'mispricing_gap': rules_result.get('mispricing_gap', 0),
-            'is_tennis': 1 if 'Tennis' in sport else 0,
-            'is_mlb': 1 if 'MLB' in sport else 0,
-            'is_nba': 1 if 'NBA' in sport else 0,
-            'is_soccer': 1 if 'Soccer' in sport else 0,
-            'is_ufc': 1 if 'UFC' in sport else 0,
-            'is_heavy_favorite': 1 if rules_result.get('tier') == 'heavy_favorite' else 0,
-            'is_moderate_favorite': 1 if rules_result.get('tier') == 'moderate_favorite' else 0,
-            'is_total_market': 1 if 'total' in market.lower() else 0,
-            'odds_american_abs': abs(odds)
-        }
-        
-        return np.array([features[col] for col in self.feature_columns])
-    
-    def train(self, historical_data: pd.DataFrame):
-        """Train the ML model on historical data"""
+        self._load()
+
+    def _load(self):
         try:
-            import lightgbm as lgb
-            from sklearn.model_selection import cross_val_score
-            from sklearn.calibration import CalibratedClassifierCV
-            
-            if len(historical_data) < 100:
-                print("⚠️  Insufficient historical data for ML training (need 100+ samples)")
-                return False
-            
-            X = historical_data[self.feature_columns].values
-            y = historical_data['outcome'].values  # 1 = win, 0 = loss
-            
-            # Train LightGBM
-            base_model = lgb.LGBMClassifier(
-                max_depth=4,
-                num_leaves=31,
-                learning_rate=0.03,
-                n_estimators=400,
-                subsample=0.7,
-                colsample_bytree=0.7,
-                min_child_samples=50,
-                reg_alpha=0.1,
-                reg_lambda=0.1,
-                random_state=42,
-                verbose=-1
-            )
-            
-            # Calibrate probabilities using Platt scaling
-            self.model = CalibratedClassifierCV(base_model, cv=5, method='sigmoid')
-            self.model.fit(X, y)
-            self.is_trained = True
-            
-            # Cross-validation score
-            cv_scores = cross_val_score(self.model, X, y, cv=5, scoring='brier_score')
-            print(f"✅ ML Model trained | Brier Score: {-cv_scores.mean():.4f}")
-            return True
-            
+            if os.path.exists(MODEL_PATH):
+                with open(MODEL_PATH, 'rb') as f:
+                    data = pickle.load(f)
+                self.model = data['model']
+                self.is_trained = True
+                print("✅ ML model loaded")
         except Exception as e:
-            print(f"⚠️  ML training failed: {e}")
-            return False
-    
-    def score(self, opportunity: dict, rules_result: dict) -> float:
-        """Get ML confidence score"""
-        if not self.is_trained or self.model is None:
-            # Fall back to rules-based score
-            return rules_result.get('rules_confidence', 0.50)
-        
+            print(f"⚠️  ML model not loaded: {e}")
+
+    def score(self, opp: dict, rules: dict) -> float:
+        if not self.is_trained:
+            return rules.get('rules_confidence', 0.50)
         try:
-            features = self.prepare_features(opportunity, rules_result)
+            sport = opp.get('sport', '')
+            odds = opp.get('odds_american', -110)
+            market = opp.get('market', 'h2h')
+            tier = rules.get('tier', 'slight_favorite')
+            tier_map = {'heavy_favorite': 3, 'moderate_favorite': 2, 'slight_favorite': 1, 'underdog': 0}
+            features = np.array([
+                opp.get('odds_decimal', 1.9),
+                opp.get('true_probability', 0.5),
+                opp.get('implied_probability', 0.5),
+                rules.get('mispricing_gap', 0),
+                1 if 'Tennis' in sport else 0,
+                1 if 'MLB' in sport else 0,
+                1 if 'NBA' in sport else 0,
+                1 if 'Soccer' in sport else 0,
+                1 if 'UFC' in sport else 0,
+                1 if tier == 'heavy_favorite' else 0,
+                1 if tier == 'moderate_favorite' else 0,
+                1 if 'total' in market.lower() else 0,
+                abs(odds),
+                tier_map.get(tier, 1)
+            ])
             prob = self.model.predict_proba(features.reshape(1, -1))[0][1]
             return round(float(prob), 4)
-        except Exception as e:
-            return rules_result.get('rules_confidence', 0.50)
+        except Exception:
+            return rules.get('rules_confidence', 0.50)
 
 
-# ─── COMBINED CONFIDENCE ENGINE ──────────────────────────────────────────────
+class RegimeDetector:
+    def detect(self, opportunities: list) -> dict:
+        month = datetime.now().month
+        if month in [1, 2]:
+            return {'regime': 'early_season', 'multiplier': 0.93, 'note': 'Early season variance'}
+        if month in [5, 6, 7, 8, 9]:
+            return {'regime': 'peak_season', 'multiplier': 1.0, 'note': 'Peak season'}
+        if month in [10, 11, 12]:
+            return {'regime': 'late_season', 'multiplier': 0.95, 'note': 'Late season'}
+        return {'regime': 'normal', 'multiplier': 1.0, 'note': 'Normal'}
+
 
 class ConfidenceEngine:
     """
-    Combines rules-based and ML scoring
-    Applies regime adjustments
-    Filters and ranks all opportunities
+    Main engine combining rules-based + ML
+    Stricter thresholds, danger flags, regime awareness
     """
-    
-    MIN_CONFIDENCE = float(os.getenv('MIN_CONFIDENCE', 0.65))
-    
-    # Confidence tiers
-    GREEN_THRESHOLD = 0.65   # Full stake
-    AMBER_THRESHOLD = 0.58   # Half stake
-    RED_THRESHOLD = 0.00     # No bet
-    
+
+    GREEN_THRESHOLD = 0.67
+    AMBER_THRESHOLD = 0.60
+
     def __init__(self):
-        self.rules_scorer = RulesScorer()
-        self.ml_scorer = MLScorer()
+        self.rules = RulesScorer()
+        self.ml = MLScorer()
+        self.regime_detector = RegimeDetector()
         self.regime = 'normal'
         self.regime_multiplier = 1.0
-    
+
     def set_regime(self, regime: str, multiplier: float):
-        """Set current market regime"""
         self.regime = regime
         self.regime_multiplier = multiplier
-        print(f"📊 Market regime: {regime} (confidence multiplier: {multiplier:.2f}x)")
-    
-    def score_opportunity(self, opportunity: dict) -> dict:
-        """Score a single opportunity with full analysis"""
-        
-        # Rules-based score
-        rules_result = self.rules_scorer.score(opportunity)
-        
-        # ML score (falls back to rules if not trained)
-        ml_confidence = self.ml_scorer.score(opportunity, rules_result)
-        
-        # Combined score (60% rules, 40% ML when ML is untrained; 40/60 when trained)
-        if self.ml_scorer.is_trained:
-            combined = (rules_result['rules_confidence'] * 0.40) + (ml_confidence * 0.60)
+
+    def score_opportunity(self, opp: dict) -> dict:
+        rules_result = self.rules.score(opp)
+
+        if rules_result.get('tier') in ['rejected', 'underdog']:
+            return {
+                **opp, **rules_result,
+                'ml_confidence': 0.0,
+                'combined_confidence': 0.0,
+                'confidence_tier': 'RED',
+                'regime': self.regime,
+                'is_value_bet': False,
+                'scored_at': datetime.now(timezone.utc).isoformat()
+            }
+
+        ml_conf = self.ml.score(opp, rules_result)
+
+        if self.ml.is_trained:
+            combined = (rules_result['rules_confidence'] * 0.35) + (ml_conf * 0.65)
         else:
-            combined = (rules_result['rules_confidence'] * 0.70) + (ml_confidence * 0.30)
-        
-        # Apply regime adjustment
+            combined = (rules_result['rules_confidence'] * 0.75) + (ml_conf * 0.25)
+
         adjusted = combined * self.regime_multiplier
-        final_confidence = max(0.30, min(0.92, adjusted))
-        
-        # Determine tier
-        if final_confidence >= self.GREEN_THRESHOLD:
+
+        danger_flags = rules_result.get('danger_flags', [])
+        if 'grand_slam_variance' in danger_flags:
+            adjusted -= 0.02
+        if 'ufc_variance' in danger_flags:
+            adjusted -= 0.03
+
+        final = max(0.30, min(0.87, adjusted))
+
+        if final >= self.GREEN_THRESHOLD:
             tier = 'GREEN'
-        elif final_confidence >= self.AMBER_THRESHOLD:
+        elif final >= self.AMBER_THRESHOLD:
             tier = 'AMBER'
         else:
             tier = 'RED'
-        
+
         return {
-            **opportunity,
-            **rules_result,
-            'ml_confidence': round(ml_confidence, 4),
-            'combined_confidence': round(final_confidence, 4),
+            **opp, **rules_result,
+            'ml_confidence': round(ml_conf, 4),
+            'combined_confidence': round(final, 4),
             'confidence_tier': tier,
             'regime': self.regime,
             'is_value_bet': rules_result.get('value_bet', False),
+            'danger_flags': danger_flags,
             'scored_at': datetime.now(timezone.utc).isoformat()
         }
-    
+
     def score_all(self, opportunities: list) -> list:
-        """Score all opportunities and return filtered, ranked results"""
-        
         print(f"\n🧠 Scoring {len(opportunities)} opportunities...")
-        
-        scored = []
-        for opp in opportunities:
-            result = self.score_opportunity(opp)
-            scored.append(result)
-        
-        # Filter to GREEN and AMBER only
+
+        regime_info = self.regime_detector.detect(opportunities)
+        self.regime = regime_info['regime']
+        self.regime_multiplier = regime_info['multiplier']
+        print(f"📊 Regime: {regime_info['regime']} — {regime_info['note']}")
+
+        scored = [self.score_opportunity(opp) for opp in opportunities]
         filtered = [s for s in scored if s['confidence_tier'] in ['GREEN', 'AMBER']]
-        
-        # Sort by combined confidence descending
         filtered.sort(key=lambda x: x['combined_confidence'], reverse=True)
-        
-        green_count = len([s for s in filtered if s['confidence_tier'] == 'GREEN'])
-        amber_count = len([s for s in filtered if s['confidence_tier'] == 'AMBER'])
-        value_bets = len([s for s in filtered if s['is_value_bet']])
-        
-        print(f"✅ Scoring complete:")
-        print(f"   🟢 GREEN (65%+): {green_count} opportunities")
-        print(f"   🟡 AMBER (58-65%): {amber_count} opportunities")
-        print(f"   💎 Value bets (mispriced 5%+): {value_bets} opportunities")
-        print(f"   🔴 RED (below threshold): {len(scored) - len(filtered)} excluded")
-        
+
+        green = len([s for s in filtered if s['confidence_tier'] == 'GREEN'])
+        amber = len([s for s in filtered if s['confidence_tier'] == 'AMBER'])
+        rejected = len([s for s in scored if s.get('tier') in ['rejected', 'underdog']])
+        values = len([s for s in filtered if s['is_value_bet']])
+
+        print(f"   🟢 GREEN (67%+): {green}")
+        print(f"   🟡 AMBER (60-67%): {amber}")
+        print(f"   💎 Value bets: {values}")
+        print(f"   🔴 Rejected (invalid/underdog): {rejected}")
+        print(f"   ⛔ Below threshold: {len(scored) - len(filtered) - rejected}")
+
         return filtered
-    
-    def get_value_anchor(self, scored_opportunities: list) -> Optional[dict]:
-        """Get the single highest confidence pick (value anchor)"""
-        if not scored_opportunities:
-            return None
-        return scored_opportunities[0]  # Already sorted by confidence
 
-
-if __name__ == "__main__":
-    # Test the confidence engine with sample data
-    print("Testing Confidence Engine...\n")
-    
-    engine = ConfidenceEngine()
-    
-    test_opportunities = [
-        {
-            'sport': 'Tennis ATP',
-            'event_name': 'Jannik Sinner vs Lucky Loser',
-            'selection': 'Jannik Sinner',
-            'odds_american': -500,
-            'odds_decimal': 1.20,
-            'true_probability': 0.85,
-            'implied_probability': 0.833,
-            'market': 'h2h',
-            'bookmaker': 'FanDuel'
-        },
-        {
-            'sport': 'MLB',
-            'event_name': 'New York Yankees vs Oakland Athletics',
-            'selection': 'New York Yankees',
-            'odds_american': -220,
-            'odds_decimal': 1.45,
-            'true_probability': 0.72,
-            'implied_probability': 0.69,
-            'market': 'h2h',
-            'bookmaker': 'DraftKings'
-        },
-        {
-            'sport': 'EPL Soccer',
-            'event_name': 'Manchester City vs Luton Town',
-            'selection': 'Manchester City',
-            'odds_american': -350,
-            'odds_decimal': 1.29,
-            'true_probability': 0.78,
-            'implied_probability': 0.778,
-            'market': 'h2h',
-            'bookmaker': 'BetMGM'
-        },
-        {
-            'sport': 'UFC/MMA',
-            'event_name': 'Islam Makhachev vs Contender',
-            'selection': 'Islam Makhachev',
-            'odds_american': -450,
-            'odds_decimal': 1.22,
-            'true_probability': 0.82,
-            'implied_probability': 0.818,
-            'market': 'h2h',
-            'bookmaker': 'FanDuel'
-        },
-        {
-            'sport': 'NBA',
-            'event_name': 'Oklahoma City Thunder vs Weak Opponent',
-            'selection': 'Oklahoma City Thunder',
-            'odds_american': -280,
-            'odds_decimal': 1.36,
-            'true_probability': 0.74,
-            'implied_probability': 0.737,
-            'market': 'h2h',
-            'bookmaker': 'DraftKings'
-        }
-    ]
-    
-    scored = engine.score_all(test_opportunities)
-    
-    print("\n📊 SCORED OPPORTUNITIES:")
-    print("-"*80)
-    for s in scored:
-        print(f"  {s['confidence_tier']:6} | {s['combined_confidence']:.1%} | {s['sport']:12} | {s['selection']:25} | {s['odds_american']:+5d} | {'💎 VALUE' if s['is_value_bet'] else ''}")
-    
-    anchor = engine.get_value_anchor(scored)
-    if anchor:
-        print(f"\n🎯 VALUE ANCHOR: {anchor['selection']} ({anchor['sport']}) @ {anchor['odds_american']:+d} | Confidence: {anchor['combined_confidence']:.1%}")
+    def get_value_anchor(self, scored: list) -> Optional[dict]:
+        return scored[0] if scored else None

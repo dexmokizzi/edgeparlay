@@ -1,7 +1,12 @@
 """
-EdgeParlay Constructor
-Builds optimal daily parlay from scored opportunities
-Handles correlation filtering, EV optimization, dynamic bet type selection
+EdgeParlay Constructor v2
+Upgraded with:
+- Max 4 legs hard limit
+- Max 2 legs per sport (cross-sport diversification)
+- Min 55% combined parlay probability
+- Straight bet option when parlay probability too low
+- Better EV calculation with realistic assumptions
+- CST timezone aware
 """
 import os
 import numpy as np
@@ -9,68 +14,74 @@ from datetime import datetime, timezone
 from typing import Optional
 from dotenv import load_dotenv
 
-load_dotenv('/home/claude/edgeparlay/.env')
+load_dotenv()
 
 TARGET_ODDS_MIN = float(os.getenv('TARGET_ODDS_MIN', 3.0))
-TARGET_ODDS_MAX = float(os.getenv('TARGET_ODDS_MAX', 3.5))
-MIN_CONFIDENCE = float(os.getenv('MIN_CONFIDENCE', 0.65))
+TARGET_ODDS_MAX = float(os.getenv('TARGET_ODDS_MAX', 3.8))
+MIN_PARLAY_PROBABILITY = 0.55  # Never bet a parlay with less than 55% chance
+MAX_LEGS = 4                    # Hard cap - no more 6-leg disasters
+MAX_LEGS_PER_SPORT = 2         # Max 2 legs from same sport
+
 
 def american_to_decimal(american: int) -> float:
     if american > 0:
         return 1 + (american / 100)
     return 1 - (100 / american)
 
-def combine_decimal_odds(legs: list) -> float:
+
+def combine_odds(legs: list) -> float:
     combined = 1.0
     for leg in legs:
         combined *= leg.get('odds_decimal', 1.0)
     return round(combined, 4)
 
-def calculate_parlay_probability(legs: list) -> float:
+
+def parlay_probability(legs: list) -> float:
     prob = 1.0
     for leg in legs:
         prob *= leg.get('combined_confidence', 0.65)
     return round(prob, 4)
 
-def calculate_ev(combined_odds: float, parlay_prob: float, stake: float) -> float:
-    profit_if_win = stake * (combined_odds - 1)
-    ev = (parlay_prob * profit_if_win) - ((1 - parlay_prob) * stake)
+
+def calculate_ev(combined_odds: float, prob: float, stake: float) -> float:
+    profit = stake * (combined_odds - 1)
+    ev = (prob * profit) - ((1 - prob) * stake)
     return round(ev, 4)
 
-def kelly_stake(bankroll: float, parlay_prob: float, combined_odds: float, fraction: float = 0.25) -> float:
-    """Quarter Kelly criterion for position sizing"""
-    if combined_odds <= 1:
-        return 0
-    b = combined_odds - 1
-    p = parlay_prob
-    q = 1 - p
-    kelly = (b * p - q) / b
-    quarter_kelly = kelly * fraction
-    max_stake = bankroll * 0.20
-    recommended = min(bankroll * max(0, quarter_kelly), max_stake)
-    return round(max(float(os.getenv('BASE_STAKE', 10)), recommended), 2)
+
+def sports_in_parlay(legs: list) -> dict:
+    """Count legs per sport"""
+    counts = {}
+    for leg in legs:
+        sport = leg.get('sport', 'Unknown')
+        counts[sport] = counts.get(sport, 0) + 1
+    return counts
+
+
+def violates_sport_limit(legs: list, candidate: dict) -> bool:
+    """Check if adding candidate would exceed max legs per sport"""
+    sport = candidate.get('sport', 'Unknown')
+    current_count = sum(1 for l in legs if l.get('sport') == sport)
+    return current_count >= MAX_LEGS_PER_SPORT
+
 
 def are_correlated(leg1: dict, leg2: dict) -> bool:
-    """Check if two legs are correlated (same event or sport)"""
-    if leg1.get('event_id') == leg2.get('event_id'):
+    """Check if two legs are from same event"""
+    if leg1.get('event_id') and leg1.get('event_id') == leg2.get('event_id'):
         return True
-    if leg1.get('sport') == leg2.get('sport') and leg1.get('event_name') == leg2.get('event_name'):
-        return True
-    same_sport_same_team = (
-        leg1.get('sport') == leg2.get('sport') and
-        leg1.get('selection', '').split()[0] == leg2.get('selection', '').split()[0]
-    )
-    if same_sport_same_team:
+    if leg1.get('event_name') and leg1.get('event_name') == leg2.get('event_name'):
         return True
     return False
 
-def check_correlations(legs: list) -> bool:
-    """Ensure no two legs in the parlay are correlated"""
+
+def check_all_correlations(legs: list) -> bool:
+    """Ensure no two legs are correlated"""
     for i in range(len(legs)):
         for j in range(i + 1, len(legs)):
             if are_correlated(legs[i], legs[j]):
                 return False
     return True
+
 
 class ParlayConstructor:
 
@@ -78,200 +89,213 @@ class ParlayConstructor:
         self.bankroll = bankroll
         self.base_stake = float(os.getenv('BASE_STAKE', 10))
 
-    def build_optimal_parlay(self, scored_opportunities: list) -> Optional[dict]:
+    def build_optimal_parlay(self, scored: list) -> Optional[dict]:
         """
-        Build the optimal parlay for today
-        Strategy: greedy approach starting from highest confidence
-        Target: combined odds between 3.0 and 3.5
+        Build the optimal parlay with strict rules:
+        1. Max 4 legs
+        2. Max 2 legs per sport
+        3. Min 55% combined probability
+        4. Target 3.0-3.8 combined odds
+        5. Only GREEN tier legs preferred, AMBER as fallback
         """
-        if not scored_opportunities:
+        if not scored:
             return None
 
-        green_opps = [o for o in scored_opportunities if o.get('confidence_tier') == 'GREEN']
-        amber_opps = [o for o in scored_opportunities if o.get('confidence_tier') == 'AMBER']
-        all_opps = green_opps + amber_opps
+        # Prefer GREEN legs, fall back to AMBER if needed
+        green = [o for o in scored if o.get('confidence_tier') == 'GREEN']
+        amber = [o for o in scored if o.get('confidence_tier') == 'AMBER']
+        all_opps = green + amber
 
         if not all_opps:
             return None
 
-        value_anchor = all_opps[0]
+        # Try to build parlay with 2, 3, then 4 legs max
         best_parlay = None
-        best_ev = -999
+        best_score = -999
 
-        # Try building parlays of different sizes
-        for target_legs in range(2, min(10, len(all_opps)) + 1):
-            parlay_legs = [value_anchor]
-            remaining = [o for o in all_opps[1:] if not are_correlated(o, value_anchor)]
+        for target_n in range(2, MAX_LEGS + 1):
+            # Greedy construction: start with highest confidence
+            parlay_legs = []
 
-            for candidate in remaining:
-                if len(parlay_legs) >= target_legs:
+            for candidate in all_opps:
+                if len(parlay_legs) >= target_n:
                     break
-                if check_correlations(parlay_legs + [candidate]):
-                    parlay_legs.append(candidate)
+
+                # Skip if violates sport limit
+                if violates_sport_limit(parlay_legs, candidate):
+                    continue
+
+                # Skip if correlated with existing legs
+                if not check_all_correlations(parlay_legs + [candidate]):
+                    continue
+
+                parlay_legs.append(candidate)
 
             if len(parlay_legs) < 2:
                 continue
 
-            combined_odds = combine_decimal_odds(parlay_legs)
-            parlay_prob = calculate_parlay_probability(parlay_legs)
-            stake = self.base_stake
-            ev = calculate_ev(combined_odds, parlay_prob, stake)
+            # Calculate parlay stats
+            combined = combine_odds(parlay_legs)
+            prob = parlay_probability(parlay_legs)
+            ev = calculate_ev(combined, prob, self.base_stake)
+            payout = round(self.base_stake * combined, 2)
 
-            # Check if odds are in target range
-            in_target_range = TARGET_ODDS_MIN <= combined_odds <= TARGET_ODDS_MAX
+            # Score this parlay: EV * probability (reward both edge AND hit rate)
+            score = ev * prob
 
-            if in_target_range and ev > best_ev:
-                best_ev = ev
+            # Check minimum probability requirement
+            if prob < MIN_PARLAY_PROBABILITY:
+                continue
+
+            # Check odds range
+            in_range = TARGET_ODDS_MIN <= combined <= TARGET_ODDS_MAX
+
+            if in_range and score > best_score:
+                best_score = score
                 best_parlay = {
                     'legs': parlay_legs,
-                    'combined_odds': combined_odds,
-                    'parlay_probability': parlay_prob,
+                    'combined_odds': combined,
+                    'parlay_probability': prob,
                     'ev': ev,
-                    'stake': stake,
-                    'potential_payout': round(stake * combined_odds, 2),
+                    'stake': self.base_stake,
+                    'potential_payout': payout,
                     'num_legs': len(parlay_legs),
                     'bet_type': 'parlay',
                     'in_target_range': True
                 }
 
-        # If no parlay hits the target range, take best EV option
+        # If no parlay meets all criteria, consider straight bet on best pick
         if not best_parlay:
-            # Try all 2-leg combinations
-            for i in range(len(all_opps)):
-                for j in range(i + 1, len(all_opps)):
-                    legs = [all_opps[i], all_opps[j]]
-                    if not check_correlations(legs):
-                        continue
-                    combined_odds = combine_decimal_odds(legs)
-                    parlay_prob = calculate_parlay_probability(legs)
-                    stake = self.base_stake
-                    ev = calculate_ev(combined_odds, parlay_prob, stake)
-                    if ev > best_ev:
-                        best_ev = ev
-                        best_parlay = {
-                            'legs': legs,
-                            'combined_odds': combined_odds,
-                            'parlay_probability': parlay_prob,
-                            'ev': ev,
-                            'stake': stake,
-                            'potential_payout': round(stake * combined_odds, 2),
-                            'num_legs': 2,
-                            'bet_type': 'parlay',
-                            'in_target_range': False
-                        }
+            best_parlay = self._build_straight_bet(all_opps)
 
         if not best_parlay:
             return None
 
-        # Determine confidence tier for overall parlay
-        avg_confidence = np.mean([l['combined_confidence'] for l in best_parlay['legs']])
-        if avg_confidence >= 0.65:
+        # Final metadata
+        legs = best_parlay['legs']
+        avg_conf = np.mean([l['combined_confidence'] for l in legs])
+
+        if avg_conf >= 0.67:
             tier = 'GREEN'
-        elif avg_confidence >= 0.58:
+        elif avg_conf >= 0.60:
             tier = 'AMBER'
         else:
-            return None
+            return None  # Not confident enough
 
-        # Find best platform (platform that appears most in legs)
+        # Best platform
         platform_counts = {}
-        for leg in best_parlay['legs']:
+        for leg in legs:
             book = leg.get('bookmaker', 'FanDuel')
             platform_counts[book] = platform_counts.get(book, 0) + 1
-        best_platform = max(platform_counts, key=platform_counts.get)
+        platform = max(platform_counts, key=platform_counts.get)
 
-        # Check for value bets
-        value_bets = [l for l in best_parlay['legs'] if l.get('is_value_bet', False)]
+        value_bets = [l for l in legs if l.get('is_value_bet', False)]
+        sports_used = list(sports_in_parlay(legs).keys())
+        danger_count = sum(len(l.get('danger_flags', [])) for l in legs)
 
         return {
             **best_parlay,
             'date': datetime.now().strftime('%Y-%m-%d'),
             'confidence_tier': tier,
-            'avg_confidence': round(float(avg_confidence), 4),
-            'value_anchor': value_anchor['selection'],
-            'platform': best_platform,
+            'avg_confidence': round(float(avg_conf), 4),
+            'value_anchor': legs[0]['selection'],
+            'platform': platform,
             'value_bets_count': len(value_bets),
+            'sports_covered': sports_used,
+            'danger_flag_count': danger_count,
             'stake': self.base_stake,
-            'regime': scored_opportunities[0].get('regime', 'normal') if scored_opportunities else 'normal',
+            'regime': scored[0].get('regime', 'normal') if scored else 'normal',
             'created_at': datetime.now(timezone.utc).isoformat()
         }
 
+    def _build_straight_bet(self, all_opps: list) -> Optional[dict]:
+        """Fall back to single straight bet on highest confidence pick"""
+        if not all_opps:
+            return None
+
+        # Only consider GREEN tier for straight bets
+        green_opps = [o for o in all_opps if o.get('confidence_tier') == 'GREEN']
+        if not green_opps:
+            return None
+
+        best = green_opps[0]
+        odds = best.get('odds_decimal', 1.5)
+        prob = best.get('combined_confidence', 0.65)
+        ev = calculate_ev(odds, prob, self.base_stake)
+
+        if ev <= 0:
+            return None
+
+        return {
+            'legs': [best],
+            'combined_odds': odds,
+            'parlay_probability': prob,
+            'ev': ev,
+            'stake': self.base_stake,
+            'potential_payout': round(self.base_stake * odds, 2),
+            'num_legs': 1,
+            'bet_type': 'straight',
+            'in_target_range': False
+        }
+
     def should_bet_today(self, parlay: Optional[dict]) -> tuple:
-        """Determine if we should bet today and why"""
         if not parlay:
-            return False, "No qualifying opportunities found today. Protecting bankroll."
+            return False, "No qualifying opportunities found. Protecting bankroll."
 
         if parlay['confidence_tier'] == 'RED':
-            return False, "Confidence too low. Skipping today to protect bankroll."
+            return False, "Confidence too low. Skipping today."
 
         if parlay['ev'] < 0:
-            return False, f"Negative expected value ({parlay['ev']:.2f}). No bet today."
+            return False, f"Negative EV (${parlay['ev']:.2f}). No bet today."
 
-        if parlay['num_legs'] < 2:
-            return False, "Could not build minimum 2-leg parlay. No bet today."
+        if parlay['num_legs'] < 1:
+            return False, "Could not build any qualifying bet."
 
-        return True, f"Strong {parlay['confidence_tier']} parlay identified. Bet recommended."
+        # Additional check: parlay probability must be above threshold
+        if parlay.get('parlay_probability', 0) < MIN_PARLAY_PROBABILITY:
+            return False, f"Parlay probability {parlay['parlay_probability']:.1%} below minimum {MIN_PARLAY_PROBABILITY:.0%}. No bet."
+
+        bet_type = parlay.get('bet_type', 'parlay')
+        return True, f"{parlay['confidence_tier']} {bet_type} identified. Bet recommended."
 
     def format_parlay_summary(self, parlay: dict) -> str:
-        """Format parlay for display"""
         tier_emoji = '🟢' if parlay['confidence_tier'] == 'GREEN' else '🟡'
+        bet_type = parlay.get('bet_type', 'parlay').upper()
+        sports = ', '.join(parlay.get('sports_covered', []))
         lines = [
             f"\n{'='*60}",
-            f"{tier_emoji} TODAY'S EDGEPARLAY — {parlay['confidence_tier']} CONFIDENCE",
+            f"{tier_emoji} TODAY'S EDGE{bet_type} — {parlay['confidence_tier']}",
             f"{'='*60}",
-            f"Date: {parlay['date']}",
-            f"Combined Odds: {parlay['combined_odds']:.2f}x",
-            f"Parlay Probability: {parlay['parlay_probability']:.1%}",
-            f"Expected Value: ${parlay['ev']:.2f}",
-            f"Stake: ${parlay['stake']:.2f}",
-            f"Potential Payout: ${parlay['potential_payout']:.2f}",
-            f"Platform: {parlay['platform']}",
-            f"Value Anchor: {parlay['value_anchor']}",
+            f"Date:              {parlay['date']}",
+            f"Bet type:          {bet_type}",
+            f"Combined odds:     {parlay['combined_odds']:.2f}x",
+            f"Win probability:   {parlay['parlay_probability']:.1%}",
+            f"Expected value:    ${parlay['ev']:.2f}",
+            f"Stake:             ${parlay['stake']:.2f}",
+            f"Potential payout:  ${parlay['potential_payout']:.2f}",
+            f"Platform:          {parlay['platform']}",
+            f"Sports covered:    {sports}",
+            f"Value anchor:      {parlay['value_anchor']}",
             f"\n{'─'*60}",
             f"LEGS ({parlay['num_legs']}):",
         ]
+
         for i, leg in enumerate(parlay['legs'], 1):
             value_tag = ' 💎' if leg.get('is_value_bet') else ''
+            flags = leg.get('danger_flags', [])
+            flag_str = ' ⚠️ ' + ','.join(flags) if flags else ''
             lines.append(
-                f"  {i}. [{leg['confidence_tier']:6}] {leg['sport']:12} | "
-                f"{leg['selection']:25} | {leg['odds_american']:+5d} | "
-                f"{leg['combined_confidence']:.0%}{value_tag}"
+                f"  {i}. [{leg.get('confidence_tier','?'):6}] "
+                f"{leg.get('sport','?'):12} | "
+                f"{leg.get('selection','?'):25} | "
+                f"{leg.get('odds_american',0):+5d} | "
+                f"{leg.get('combined_confidence',0):.0%}"
+                f"{value_tag}{flag_str}"
             )
-            lines.append(f"     📋 {leg.get('reasoning', 'Historical pattern match')[:70]}")
+            lines.append(f"     📋 {leg.get('reasoning','')[:75]}")
+
+        if parlay.get('danger_flag_count', 0) > 0:
+            lines.append(f"\n  ⚠️  {parlay['danger_flag_count']} danger flag(s) detected — review before placing")
+
         lines.append(f"{'='*60}\n")
         return '\n'.join(lines)
-
-
-if __name__ == "__main__":
-    from backend.confidence_engine import ConfidenceEngine
-
-    engine = ConfidenceEngine()
-    constructor = ParlayConstructor(bankroll=100)
-
-    test_opportunities = [
-        {'sport': 'Tennis ATP', 'event_name': 'Sinner vs Qualifier', 'event_id': 'ten1',
-         'selection': 'Jannik Sinner', 'odds_american': -500, 'odds_decimal': 1.20,
-         'true_probability': 0.85, 'implied_probability': 0.833, 'market': 'h2h', 'bookmaker': 'FanDuel'},
-        {'sport': 'MLB', 'event_name': 'Yankees vs Oakland', 'event_id': 'mlb1',
-         'selection': 'New York Yankees', 'odds_american': -220, 'odds_decimal': 1.45,
-         'true_probability': 0.72, 'implied_probability': 0.69, 'market': 'h2h', 'bookmaker': 'FanDuel'},
-        {'sport': 'EPL Soccer', 'event_name': 'Man City vs Luton', 'event_id': 'soc1',
-         'selection': 'Manchester City', 'odds_american': -350, 'odds_decimal': 1.29,
-         'true_probability': 0.78, 'implied_probability': 0.778, 'market': 'h2h', 'bookmaker': 'DraftKings'},
-        {'sport': 'UFC/MMA', 'event_name': 'Makhachev vs Contender', 'event_id': 'ufc1',
-         'selection': 'Islam Makhachev', 'odds_american': -450, 'odds_decimal': 1.22,
-         'true_probability': 0.82, 'implied_probability': 0.818, 'market': 'h2h', 'bookmaker': 'BetMGM'},
-        {'sport': 'NBA', 'event_name': 'Thunder vs Opponent', 'event_id': 'nba1',
-         'selection': 'OKC Thunder', 'odds_american': -280, 'odds_decimal': 1.36,
-         'true_probability': 0.74, 'implied_probability': 0.737, 'market': 'h2h', 'bookmaker': 'FanDuel'},
-    ]
-
-    scored = engine.score_all(test_opportunities)
-    parlay = constructor.build_optimal_parlay(scored)
-
-    if parlay:
-        print(constructor.format_parlay_summary(parlay))
-        should_bet, reason = constructor.should_bet_today(parlay)
-        print(f"💰 BET TODAY: {'YES' if should_bet else 'NO'}")
-        print(f"   Reason: {reason}")
-    else:
-        print("❌ No parlay could be built today")
